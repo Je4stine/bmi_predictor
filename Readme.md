@@ -45,12 +45,6 @@ Install the Python dependencies used by the scripts:
 pip install tensorflow pandas numpy pillow scikit-learn opencv-python mediapipe shap matplotlib
 ```
 
-For the PHP examples/tests:
-
-```bash
-composer install
-```
-
 ## Prepare Cropped Images
 
 To create body and face crops from the raw dataset:
@@ -137,5 +131,5 @@ These output folders are ignored by Git.
 
 - Keep raw image data in `visual_bmi/`.
 - Keep generated crops in `visual_bmi_cropped/`.
-- Do not commit datasets, generated model files, virtual environments, or Composer `vendor/`.
+- Do not commit datasets, generated model files, or virtual environments.
 - If an image path in the CSV does not resolve, the loader searches under the dataset folder and common nested paths such as `bodyface_1to17/`.
