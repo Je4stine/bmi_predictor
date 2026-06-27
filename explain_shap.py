@@ -12,6 +12,7 @@ the body branch, the paired face crop and is_female value are held fixed.
 Example:
     python explain_shap.py --branch body --row-index 0
     python explain_shap.py --branch face --row-index 0 --max-evals 800
+    python explain_shap.py --branch body --body-image path/to/body.jpg --face-image path/to/face.jpg --is-female 1
 """
 
 import argparse
@@ -31,6 +32,7 @@ from PIL import Image
 
 IMG_SIZE = 224
 DEFAULT_OUTPUT_DIR = Path("outputs_v4/shap_explanations")
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def parse_args():
@@ -81,6 +83,29 @@ def parse_args():
         default="blur(32,32)",
         help='Image masking strategy, such as "blur(32,32)", "inpaint_telea", or "inpaint_ns".',
     )
+    parser.add_argument(
+        "--body-image",
+        default=None,
+        help="Path to a specific body image to explain instead of reading split CSV rows.",
+    )
+    parser.add_argument(
+        "--face-image",
+        default=None,
+        help="Path to the paired face image when using --body-image.",
+    )
+    parser.add_argument(
+        "--is-female",
+        type=float,
+        choices=(0.0, 1.0),
+        default=None,
+        help="Auxiliary model input for direct image mode: 1 for female, 0 for not female.",
+    )
+    parser.add_argument(
+        "--actual-bmi",
+        type=float,
+        default=np.nan,
+        help="Optional actual BMI for direct image mode. Used only in titles and summary CSV.",
+    )
     return parser.parse_args()
 
 
@@ -100,8 +125,40 @@ def require_runtime_imports():
     return shap, tf
 
 
-def load_image(path):
-    image = Image.open(path).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
+def resolve_image_path(path, branch):
+    path = Path(str(path))
+    if path.exists():
+        return path
+
+    parts = list(path.parts)
+    branch_dir = "body" if branch == "body" else "face"
+    candidates = []
+
+    if branch_dir in parts:
+        idx = parts.index(branch_dir)
+        suffix = Path(*parts[idx + 1 :])
+        candidates.extend(
+            [
+                PROJECT_ROOT / "visual_bmi_cropped" / branch_dir / suffix,
+                PROJECT_ROOT / "visual_bmi_cropped" / branch_dir / "Visual BMI" / suffix,
+            ]
+        )
+
+    basename = path.name
+    candidates.extend(PROJECT_ROOT.glob(f"visual_bmi_cropped/{branch_dir}/**/{basename}"))
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(
+        f"Could not find {branch} image. Original path: {path}"
+    )
+
+
+def load_image(path, branch):
+    image_path = resolve_image_path(path, branch)
+    image = Image.open(image_path).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
     return np.asarray(image, dtype=np.float32) / 255.0
 
 
@@ -109,9 +166,43 @@ def predict_bmi(model, body, face, is_female):
     return float(model.predict([body, face, is_female], verbose=0).reshape(-1)[0])
 
 
+def make_direct_image_row(args):
+    if args.body_image is None and args.face_image is None:
+        return None
+
+    missing = []
+    if args.body_image is None:
+        missing.append("--body-image")
+    if args.face_image is None:
+        missing.append("--face-image")
+    if args.is_female is None:
+        missing.append("--is-female")
+    if missing:
+        raise ValueError(
+            "Direct image mode requires " + ", ".join(missing)
+        )
+
+    body_path = Path(args.body_image).expanduser()
+    face_path = Path(args.face_image).expanduser()
+    if not body_path.exists():
+        raise FileNotFoundError(f"Body image not found: {body_path}")
+    if not face_path.exists():
+        raise FileNotFoundError(f"Face image not found: {face_path}")
+
+    return {
+        "body_path_resolved": str(body_path),
+        "face_path_resolved": str(face_path),
+        "aux_is_female": args.is_female,
+        "target_bmi": args.actual_bmi,
+        "image_id": body_path.stem,
+    }
+
+
 def explain_one_row(shap, model, row, row_index, branch, max_evals, mask, output_dir):
-    body = load_image(row["body_path_resolved"])[None, ...]
-    face = load_image(row["face_path_resolved"])[None, ...]
+    body_path = resolve_image_path(row["body_path_resolved"], "body")
+    face_path = resolve_image_path(row["face_path_resolved"], "face")
+    body = load_image(body_path, "body")[None, ...]
+    face = load_image(face_path, "face")[None, ...]
     is_female = np.asarray([[float(row["aux_is_female"])]], dtype=np.float32)
 
     actual_bmi = float(row["target_bmi"])
@@ -159,8 +250,8 @@ def explain_one_row(shap, model, row, row_index, branch, max_evals, mask, output
         "row_index": row_index,
         "branch": branch,
         "image_id": row.get("image_id", ""),
-        "body_path": row["body_path_resolved"],
-        "face_path": row["face_path_resolved"],
+        "body_path": str(body_path),
+        "face_path": str(face_path),
         "is_female": float(row["aux_is_female"]),
         "actual_bmi": actual_bmi,
         "predicted_bmi": predicted_bmi,
@@ -179,38 +270,44 @@ def main():
 
     if not model_path.exists():
         raise FileNotFoundError(f"Model not found: {model_path}")
-    if not split_csv.exists():
-        raise FileNotFoundError(f"Split CSV not found: {split_csv}")
 
-    df = pd.read_csv(split_csv)
-    required = {
-        "body_path_resolved",
-        "face_path_resolved",
-        "aux_is_female",
-        "target_bmi",
-    }
-    missing = sorted(required - set(df.columns))
-    if missing:
-        raise ValueError(f"Missing required columns in {split_csv}: {missing}")
+    direct_row = make_direct_image_row(args)
+    if direct_row is None:
+        if not split_csv.exists():
+            raise FileNotFoundError(f"Split CSV not found: {split_csv}")
 
-    start = args.row_index
-    end = start + args.num_samples
-    if start < 0 or end > len(df):
-        raise IndexError(
-            f"Requested rows [{start}, {end}) but {split_csv} has {len(df)} rows."
-        )
+        df = pd.read_csv(split_csv)
+        required = {
+            "body_path_resolved",
+            "face_path_resolved",
+            "aux_is_female",
+            "target_bmi",
+        }
+        missing = sorted(required - set(df.columns))
+        if missing:
+            raise ValueError(f"Missing required columns in {split_csv}: {missing}")
+
+        start = args.row_index
+        end = start + args.num_samples
+        if start < 0 or end > len(df):
+            raise IndexError(
+                f"Requested rows [{start}, {end}) but {split_csv} has {len(df)} rows."
+            )
+        rows_to_explain = [(row_index, df.iloc[row_index]) for row_index in range(start, end)]
+    else:
+        rows_to_explain = [("custom", direct_row)]
 
     print(f"Loading model: {model_path}")
     model = tf.keras.models.load_model(model_path, compile=False)
 
     summary_rows = []
-    for row_index in range(start, end):
+    for row_index, row in rows_to_explain:
         print(f"Explaining {args.branch} branch for row {row_index}...")
         summary_rows.append(
             explain_one_row(
                 shap=shap,
                 model=model,
-                row=df.iloc[row_index],
+                row=row,
                 row_index=row_index,
                 branch=args.branch,
                 max_evals=args.max_evals,
